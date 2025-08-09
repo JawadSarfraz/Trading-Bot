@@ -1,0 +1,21 @@
+# Python virtual environments
+env/
+venv/
+ENV/
+VENV/
+.venv/
+.python-version
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pip cache
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# macOS Finder files
+.DS_Store
