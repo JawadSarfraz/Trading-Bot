@@ -1,162 +1,240 @@
-# app.py
-import os, math
+import os, time, math
+from datetime import datetime, timezone
+from typing import Dict, Any
+
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 import ccxt
 
 load_dotenv()
 
-SECRET        = os.getenv("TV_WEBHOOK_SECRET")
-API_KEY       = os.getenv("MEXC_KEY")
-API_SEC       = os.getenv("MEXC_SECRET")
-POS_USDT      = float(os.getenv("POSITION_USDT", "20"))     # fixed notional per signal
-LEVERAGE      = int(os.getenv("DEFAULT_LEVERAGE", "5"))
-ACCOUNT_TYPE  = os.getenv("ACCOUNT_TYPE", "swap")           # USDT-M Perp
-DRY_RUN       = os.getenv("DRY_RUN", "1") == "1"            # default ON while unfunded
+# ---- ENV ----
+SECRET = os.getenv("TV_WEBHOOK_SECRET")
+API_KEY = os.getenv("MEXC_KEY")
+API_SEC = os.getenv("MEXC_SECRET")
+POS_USDT = float(os.getenv("POSITION_USDT", "20"))
+LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
+ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "swap")  # "swap" for USDT-M perp
 
-if not all([SECRET, API_KEY, API_SEC]):
-    raise RuntimeError("Missing env vars. Check .env")
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "on")
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
+TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0"))   # informational in DRY_RUN
+SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0"))     # informational in DRY_RUN
 
+if not SECRET:
+    raise RuntimeError("Missing TV_WEBHOOK_SECRET in .env")
+
+# ---- EXCHANGE (public endpoints are fine even without keys) ----
 exchange = ccxt.mexc({
-    "apiKey": API_KEY,
-    "secret": API_SEC,
+    "apiKey": API_KEY or "",
+    "secret": API_SEC or "",
     "enableRateLimit": True,
-    "options": {"defaultType": ACCOUNT_TYPE},               # futures/swap context
+    "options": {"defaultType": ACCOUNT_TYPE},
 })
 
+# ---- APP ----
 app = FastAPI()
-SEEN = set()  # idempotency
 
-# --- Symbol map (extend as you add pairs) ---
+# ---- State & helpers ----
+SEEN_KEYS = set()  # idempotency (bar_ts:symbol_tv:side)
+
+# simple in-memory position state per symbol
+STATE: Dict[str, Dict[str, Any]] = {}  # {symbol: {side, entry, size, last_fill_ts, cooldown_until}}
+
+# TV -> CCXT symbol map (extend as needed)
 SYMBOL_MAP = {
-    # TradingView ticker (chart)         # ccxt contract symbol
     "MEXC:ETHUSDT": "ETH/USDT:USDT",
-    "ETHUSDT":      "ETH/USDT:USDT",
-
+    "ETHUSDT": "ETH/USDT:USDT",
     "MEXC:BTCUSDT": "BTC/USDT:USDT",
-    "BTCUSDT":      "BTC/USDT:USDT",
+    "BTCUSDT": "BTC/USDT:USDT",
+}
+
+# contract sizes for linear USDT-M perps (approx; fine for DRY_RUN sizing)
+CONTRACT_SIZE = {
+    "ETH/USDT:USDT": 0.01,   # 0.01 ETH per contract
+    "BTC/USDT:USDT": 0.001,  # 0.001 BTC per contract
 }
 
 def map_symbol(symbol_tv: str) -> str:
-    return SYMBOL_MAP.get(symbol_tv, "ETH/USDT:USDT")  # default to ETH
+    return SYMBOL_MAP.get(symbol_tv, symbol_tv)
 
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "secret_loaded": bool(SECRET),
-        "ccxt_version": getattr(ccxt, "__version__", "unknown"),
-        "dry_run": DRY_RUN,
-        "account_type": ACCOUNT_TYPE,
-    }
+def contract_size_for(symbol: str) -> float:
+    return CONTRACT_SIZE.get(symbol, 0.01)
 
-@app.get("/debug/{symbol_tv}")
-def dbg(symbol_tv: str):
-    symbol = map_symbol(symbol_tv)
-    markets = exchange.load_markets()
-    m = markets[symbol]
-    return {
-        "symbol_tv": symbol_tv,
-        "symbol_mapped": symbol,
-        "type": m.get("type"),
-        "contract": m.get("contract"),
-        "linear": m.get("linear"),
-        "contractSize": m.get("contractSize"),
-        "limits": m.get("limits", {}),
-        "has_createOrder": exchange.has.get("createOrder"),
-    }
+def now_ts() -> float:
+    return time.time()
+
+def fmt_ts(ts: float | int | str) -> str:
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        return str(ts)
+    except Exception:
+        return str(ts)
+
+def get_last_price(symbol: str) -> float:
+    ticker = exchange.fetch_ticker(symbol)
+    return float(ticker["last"])
+
+def position_for(symbol: str) -> Dict[str, Any]:
+    if symbol not in STATE:
+        STATE[symbol] = {
+            "side": "flat",
+            "entry": None,
+            "size": 0,
+            "last_fill_ts": 0.0,
+            "cooldown_until": 0.0,
+        }
+    return STATE[symbol]
+
+def in_cooldown(pos: Dict[str, Any]) -> bool:
+    return now_ts() < float(pos.get("cooldown_until", 0.0))
+
+def apply_cooldown(pos: Dict[str, Any]):
+    pos["cooldown_until"] = now_ts() + COOLDOWN_SEC
+
+def calc_contracts(symbol: str, usd_notional: float, price: float) -> int:
+    cs = contract_size_for(symbol)
+    # contracts = notional / (price * contractSize)
+    raw = usd_notional / (price * cs)
+    return max(1, int(math.floor(raw)))
+
+# ---- Routes ----
+
+@app.get("/")
+def root():
+    return {"ok": True, "dry_run": DRY_RUN, "account_type": ACCOUNT_TYPE}
+
+@app.get("/state")
+def state():
+    return {"state": STATE, "seen_keys": len(SEEN_KEYS)}
 
 @app.post("/tv")
 async def tv(req: Request):
-    # ---- 1) parse & auth ----
+    # ---- parse & validate ----
     try:
-        p = await req.json()
+        payload = await req.json()
     except Exception:
         raise HTTPException(400, "Invalid JSON")
 
-    if p.get("secret") != SECRET:
+    if payload.get("secret") != SECRET:
         raise HTTPException(403, "Bad secret")
 
-    side      = p.get("side")                  # "long" | "short"
-    symbol_tv = p.get("symbol_tv")             # e.g., "MEXC:ETHUSDT"
-    bar_ts    = p.get("bar_ts")                # ISO time
+    side = payload.get("side")           # "long" | "short"
+    symbol_tv = payload.get("symbol_tv") # e.g. "MEXC:ETHUSDT"
+    bar_ts = payload.get("bar_ts")       # ISO string from TV
+
     if side not in ("long", "short") or not symbol_tv or not bar_ts:
-        raise HTTPException(400, "Missing required fields")
+        raise HTTPException(400, "Missing required fields: side, symbol_tv, bar_ts")
 
-    # ---- 2) idempotency ----
-    key = f"{bar_ts}:{symbol_tv}:{side}"
-    if key in SEEN:
+    # idempotency key: 1 order per bar per side per symbol
+    dedupe_key = f"{bar_ts}:{symbol_tv}:{side}"
+    if dedupe_key in SEEN_KEYS:
         return {"status": "duplicate_ignored"}
-    SEEN.add(key)
+    SEEN_KEYS.add(dedupe_key)
 
-    # ---- 3) market & leverage ----
     symbol = map_symbol(symbol_tv)
-    try:
-        markets = exchange.load_markets()
-        m = markets[symbol]
-    except Exception as e:
-        raise HTTPException(400, f"Unsupported symbol: {symbol} ({e})")
 
+    # load markets once (ccxt caches internally); set leverage best-effort
     try:
-        exchange.set_leverage(LEVERAGE, symbol)   # ignore if already set
+        exchange.load_markets()
+    except Exception:
+        pass
+    try:
+        # harmless if already set / or in DRY_RUN
+        exchange.set_leverage(LEVERAGE, symbol)
     except Exception:
         pass
 
-    # ---- 4) pricing ----
+    # get mark/last price for sizing
     try:
-        last = float(exchange.fetch_ticker(symbol)["last"])
+        last = get_last_price(symbol)
     except Exception as e:
-        raise HTTPException(502, f"Failed to fetch price: {e}")
+        raise HTTPException(500, f"Failed to fetch price for {symbol}: {e}")
 
-    # ---- 5) sizing: notional -> contracts (integer) ----
-    try:
-        if m.get("contract"):
-            contract_size = float(m.get("contractSize") or 1.0)    # e.g., ETH ~ 0.01
-            base_qty      = POS_USDT / last                        # ETH amount desired
-            contracts_f   = base_qty / contract_size
-            contracts     = int(math.floor(contracts_f))
-            min_contracts = int(m.get("limits", {}).get("amount", {}).get("min") or 1)
-            if contracts < min_contracts:
-                raise HTTPException(
-                    400,
-                    f"Too small: {contracts} < min {min_contracts}. "
-                    f"Increase POSITION_USDT or leverage."
-                )
-            amount = contracts
-        else:
-            # (Spot path, not used here)
-            raw_qty = POS_USDT / last
-            qty_str = exchange.amount_to_precision(symbol, raw_qty)
-            amount  = float(qty_str)
-            if amount <= 0:
-                raise HTTPException(400, "Computed qty is zero; increase POSITION_USDT")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Sizing error: {e}")
+    # position state & cooldown
+    pos = position_for(symbol)
+    if in_cooldown(pos):
+        return {"status": "cooldown", "until": fmt_ts(pos["cooldown_until"]), "symbol": symbol}
 
-    # ---- 6) order placement ----
-    if DRY_RUN:
-        order = {"id": f"sim-{symbol}-{side}"}
-        status = "simulated_ok"
+    # if we're already in that side, ignore
+    if pos["side"] == side:
+        return {"status": "already_in_position", "symbol": symbol, "side": side}
+
+    # if we are in the opposite side, "close" it first (DRY_RUN)
+    flipped_from = None
+    if pos["side"] in ("long", "short") and pos["side"] != side:
+        flipped_from = pos["side"]
+        # In DRY_RUN, we just log the PnL baseline; in LIVE we'll send reduce-only close
+        pos["side"] = "flat"
+        pos["entry"] = None
+        pos["size"] = 0
+
+    # sizing
+    contracts = calc_contracts(symbol, POS_USDT, last)
+
+    # optional TP/SL levels (informational in DRY_RUN)
+    if TP_PCT > 0:
+        tp = last * (1 + TP_PCT if side == "long" else 1 - TP_PCT)
     else:
-        try:
-            if side == "long":
-                order = exchange.create_market_buy_order(symbol, amount)
-            else:
-                order = exchange.create_market_sell_order(symbol, amount)
-            status = "ok"
-        except Exception as e:
-            # If CCXT version complains about createSwapOrder, upgrade ccxt and/or tweak ACCOUNT_TYPE.
-            raise HTTPException(502, f"Order error: {e}")
+        tp = None
+    if SL_PCT > 0:
+        sl = last * (1 - SL_PCT if side == "long" else 1 + SL_PCT)
+    else:
+        sl = None
+
+    # ---- Place order ----
+    if DRY_RUN:
+        # simulate a market fill
+        order_id = f"sim-{symbol}-{side}"
+        pos["side"] = side
+        pos["entry"] = last
+        pos["size"] = contracts
+        pos["last_fill_ts"] = now_ts()
+        apply_cooldown(pos)
+
+        return {
+            "status": "simulated_ok",
+            "symbol": symbol,
+            "side": side,
+            "amount_sent": contracts,
+            "contracts_mode": True,
+            "contractSize": contract_size_for(symbol),
+            "price_used": last,
+            "order_id": order_id,
+            "flipped_from": flipped_from,
+            "tp": tp,
+            "sl": sl,
+        }
+
+    # ---- LIVE path (to be enabled when funded) ----
+    try:
+        # IMPORTANT: for MEXC linear swaps you usually send amount=contracts in market orders.
+        # ccxt will handle correct side; add any required params here if needed.
+        if side == "long":
+            order = exchange.create_market_buy_order(symbol, contracts)
+        else:
+            order = exchange.create_market_sell_order(symbol, contracts)
+    except Exception as e:
+        raise HTTPException(500, f"Order error: {e}")
+
+    # update state
+    pos["side"] = side
+    pos["entry"] = last
+    pos["size"] = contracts
+    pos["last_fill_ts"] = now_ts()
+    apply_cooldown(pos)
 
     return {
-        "status": status,
+        "status": "ok",
         "symbol": symbol,
         "side": side,
-        "amount_sent": amount,
-        "contracts_mode": bool(m.get("contract")),
-        "contractSize": m.get("contractSize"),
+        "amount_sent": contracts,
+        "contracts_mode": True,
+        "contractSize": contract_size_for(symbol),
         "price_used": last,
         "order_id": order.get("id"),
+        "flipped_from": flipped_from,
+        "tp": tp,
+        "sl": sl,
     }
