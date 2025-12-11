@@ -1,12 +1,22 @@
 import os, time, math
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import ccxt
+import asyncio
+import logging
 
 load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ---- ENV ----
 SECRET = os.getenv("TV_WEBHOOK_SECRET")
@@ -21,6 +31,10 @@ COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
 TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0"))   # informational in DRY_RUN
 SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0"))     # informational in DRY_RUN
 
+# Safety switches
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+BAR_STALENESS_HOURS = int(os.getenv("BAR_STALENESS_HOURS", "48"))  # Ignore signals older than this
+
 if not SECRET:
     raise RuntimeError("Missing TV_WEBHOOK_SECRET in .env")
 
@@ -32,8 +46,31 @@ exchange = ccxt.mexc({
     "options": {"defaultType": ACCOUNT_TYPE},
 })
 
+# ---- Background Tasks ----
+async def start_email_poller():
+    """Start email polling in background"""
+    try:
+        from email_poller import poll_emails_loop
+        logger.info("Starting email poller background task...")
+        # Create background task
+        task = asyncio.create_task(poll_emails_loop())
+        # Don't await - let it run in background
+        logger.info("Email poller started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start email poller: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown"""
+    # Startup
+    logger.info("Application starting...")
+    await start_email_poller()
+    yield
+    # Shutdown
+    logger.info("Application shutting down...")
+
 # ---- APP ----
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # ---- State & helpers ----
 SEEN_KEYS = set()  # idempotency (bar_ts:symbol_tv:side)
@@ -47,12 +84,15 @@ SYMBOL_MAP = {
     "ETHUSDT": "ETH/USDT:USDT",
     "MEXC:BTCUSDT": "BTC/USDT:USDT",
     "BTCUSDT": "BTC/USDT:USDT",
+    "MEXC:SOLUSDT": "SOL/USDT:USDT",
+    "SOLUSDT": "SOL/USDT:USDT",
 }
 
-# contract sizes for linear USDT-M perps (approx; fine for DRY_RUN sizing)
+# contract sizes for linear USDT-M perps
 CONTRACT_SIZE = {
     "ETH/USDT:USDT": 0.01,   # 0.01 ETH per contract
     "BTC/USDT:USDT": 0.001,  # 0.001 BTC per contract
+    "SOL/USDT:USDT": 0.1,    # 0.1 SOL per contract
 }
 
 def map_symbol(symbol_tv: str) -> str:
@@ -99,81 +139,107 @@ def calc_contracts(symbol: str, usd_notional: float, price: float) -> int:
     raw = usd_notional / (price * cs)
     return max(1, int(math.floor(raw)))
 
-# ---- Routes ----
-
-@app.get("/")
-def root():
-    return {"ok": True, "dry_run": DRY_RUN, "account_type": ACCOUNT_TYPE}
-
-@app.get("/state")
-def state():
-    return {"state": STATE, "seen_keys": len(SEEN_KEYS)}
-
-@app.post("/tv")
-async def tv(req: Request):
-    # ---- parse & validate ----
+def validate_bar_timestamp(bar_ts: str) -> bool:
+    """Check if bar timestamp is not too stale (within BAR_STALENESS_HOURS)"""
     try:
-        payload = await req.json()
+        if isinstance(bar_ts, str):
+            # Parse ISO format timestamp
+            dt = datetime.fromisoformat(bar_ts.replace('Z', '+00:00'))
+        else:
+            return False
+        
+        age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        return age_hours <= BAR_STALENESS_HOURS
     except Exception:
-        raise HTTPException(400, "Invalid JSON")
+        return False
 
-    if payload.get("secret") != SECRET:
-        raise HTTPException(403, "Bad secret")
-
-    side = payload.get("side")           # "long" | "short"
-    symbol_tv = payload.get("symbol_tv") # e.g. "MEXC:ETHUSDT"
-    bar_ts = payload.get("bar_ts")       # ISO string from TV
-
+def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Core order execution logic extracted from /tv endpoint.
+    Can be called from webhook or email processing.
+    
+    Args:
+        payload: Dict with keys: side, symbol_tv, bar_ts, secret (optional for internal calls)
+    
+    Returns:
+        Dict with order execution result
+    """
+    # Safety check
+    if not TRADING_ENABLED:
+        return {"status": "trading_disabled", "message": "TRADING_ENABLED is false"}
+    
+    # Validate payload
+    side = payload.get("side")
+    symbol_tv = payload.get("symbol_tv")
+    bar_ts = payload.get("bar_ts")
+    
     if side not in ("long", "short") or not symbol_tv or not bar_ts:
-        raise HTTPException(400, "Missing required fields: side, symbol_tv, bar_ts")
-
-    # idempotency key: 1 order per bar per side per symbol
+        return {"status": "error", "message": "Missing required fields: side, symbol_tv, bar_ts"}
+    
+    # Validate secret if provided (for external calls)
+    if payload.get("secret") and payload.get("secret") != SECRET:
+        return {"status": "error", "message": "Invalid secret"}
+    
+    # Check bar staleness
+    if not validate_bar_timestamp(bar_ts):
+        return {"status": "stale_signal", "message": f"Bar timestamp is older than {BAR_STALENESS_HOURS} hours"}
+    
+    # Idempotency check
     dedupe_key = f"{bar_ts}:{symbol_tv}:{side}"
     if dedupe_key in SEEN_KEYS:
         return {"status": "duplicate_ignored"}
     SEEN_KEYS.add(dedupe_key)
-
+    
     symbol = map_symbol(symbol_tv)
-
-    # load markets once (ccxt caches internally); set leverage best-effort
+    
+    # Load markets and set leverage
     try:
         exchange.load_markets()
     except Exception:
         pass
     try:
-        # harmless if already set / or in DRY_RUN
         exchange.set_leverage(LEVERAGE, symbol)
     except Exception:
         pass
-
-    # get mark/last price for sizing
+    
+    # Get current price
     try:
         last = get_last_price(symbol)
     except Exception as e:
-        raise HTTPException(500, f"Failed to fetch price for {symbol}: {e}")
-
-    # position state & cooldown
+        return {"status": "error", "message": f"Failed to fetch price for {symbol}: {e}"}
+    
+    # Position state & cooldown
     pos = position_for(symbol)
     if in_cooldown(pos):
         return {"status": "cooldown", "until": fmt_ts(pos["cooldown_until"]), "symbol": symbol}
-
-    # if we're already in that side, ignore
+    
+    # If already in that side, ignore
     if pos["side"] == side:
         return {"status": "already_in_position", "symbol": symbol, "side": side}
-
-    # if we are in the opposite side, "close" it first (DRY_RUN)
+    
+    # If in opposite side, close it first
     flipped_from = None
     if pos["side"] in ("long", "short") and pos["side"] != side:
         flipped_from = pos["side"]
-        # In DRY_RUN, we just log the PnL baseline; in LIVE we'll send reduce-only close
+        # In DRY_RUN, we just log; in LIVE we'll send reduce-only close
+        if not DRY_RUN and pos["size"] > 0:
+            try:
+                # Close existing position with reduce-only order
+                if flipped_from == "long":
+                    exchange.create_market_sell_order(symbol, pos["size"], params={"reduceOnly": True})
+                else:
+                    exchange.create_market_buy_order(symbol, pos["size"], params={"reduceOnly": True})
+            except Exception as e:
+                # Log error but continue with new position
+                pass
         pos["side"] = "flat"
         pos["entry"] = None
         pos["size"] = 0
-
-    # sizing
+    
+    # Calculate contract size
     contracts = calc_contracts(symbol, POS_USDT, last)
-
-    # optional TP/SL levels (informational in DRY_RUN)
+    
+    # Calculate TP/SL levels
     if TP_PCT > 0:
         tp = last * (1 + TP_PCT if side == "long" else 1 - TP_PCT)
     else:
@@ -182,17 +248,16 @@ async def tv(req: Request):
         sl = last * (1 - SL_PCT if side == "long" else 1 + SL_PCT)
     else:
         sl = None
-
-    # ---- Place order ----
+    
+    # Place order
     if DRY_RUN:
-        # simulate a market fill
         order_id = f"sim-{symbol}-{side}"
         pos["side"] = side
         pos["entry"] = last
         pos["size"] = contracts
         pos["last_fill_ts"] = now_ts()
         apply_cooldown(pos)
-
+        
         return {
             "status": "simulated_ok",
             "symbol": symbol,
@@ -206,35 +271,77 @@ async def tv(req: Request):
             "tp": tp,
             "sl": sl,
         }
-
-    # ---- LIVE path (to be enabled when funded) ----
+    
+    # LIVE trading path
     try:
-        # IMPORTANT: for MEXC linear swaps you usually send amount=contracts in market orders.
-        # ccxt will handle correct side; add any required params here if needed.
         if side == "long":
             order = exchange.create_market_buy_order(symbol, contracts)
         else:
             order = exchange.create_market_sell_order(symbol, contracts)
+        
+        order_id = order.get("id")
+        
+        # Update state
+        pos["side"] = side
+        pos["entry"] = last
+        pos["size"] = contracts
+        pos["last_fill_ts"] = now_ts()
+        apply_cooldown(pos)
+        
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "side": side,
+            "amount_sent": contracts,
+            "contracts_mode": True,
+            "contractSize": contract_size_for(symbol),
+            "price_used": last,
+            "order_id": order_id,
+            "flipped_from": flipped_from,
+            "tp": tp,
+            "sl": sl,
+        }
     except Exception as e:
-        raise HTTPException(500, f"Order error: {e}")
+        return {"status": "error", "message": f"Order error: {e}"}
 
-    # update state
-    pos["side"] = side
-    pos["entry"] = last
-    pos["size"] = contracts
-    pos["last_fill_ts"] = now_ts()
-    apply_cooldown(pos)
+# ---- Routes ----
 
+@app.get("/")
+def root():
+    return {"ok": True, "dry_run": DRY_RUN, "account_type": ACCOUNT_TYPE}
+
+@app.get("/health")
+def health():
+    """Health check endpoint for monitoring"""
     return {
-        "status": "ok",
-        "symbol": symbol,
-        "side": side,
-        "amount_sent": contracts,
-        "contracts_mode": True,
-        "contractSize": contract_size_for(symbol),
-        "price_used": last,
-        "order_id": order.get("id"),
-        "flipped_from": flipped_from,
-        "tp": tp,
-        "sl": sl,
+        "status": "healthy",
+        "trading_enabled": TRADING_ENABLED,
+        "dry_run": DRY_RUN,
+        "account_type": ACCOUNT_TYPE,
     }
+
+@app.get("/state")
+def state():
+    return {"state": STATE, "seen_keys": len(SEEN_KEYS)}
+
+@app.post("/tv")
+async def tv(req: Request):
+    """Webhook endpoint for TradingView alerts (direct POST)"""
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    if payload.get("secret") != SECRET:
+        raise HTTPException(403, "Bad secret")
+    
+    # Use extracted execute_order function
+    result = execute_order(payload)
+    
+    # Convert error status to HTTP exceptions for webhook compatibility
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("message", "Order execution failed"))
+    if result.get("status") == "trading_disabled":
+        raise HTTPException(503, "Trading is disabled")
+    
+    return result
