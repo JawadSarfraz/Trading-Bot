@@ -81,10 +81,13 @@ STATE: Dict[str, Dict[str, Any]] = {}  # {symbol: {side, entry, size, last_fill_
 # TV -> CCXT symbol map (extend as needed)
 SYMBOL_MAP = {
     "MEXC:ETHUSDT": "ETH/USDT:USDT",
+    "MEXC:ETHUSDT.P": "ETH/USDT:USDT",  # TradingView sometimes adds .P suffix
     "ETHUSDT": "ETH/USDT:USDT",
     "MEXC:BTCUSDT": "BTC/USDT:USDT",
+    "MEXC:BTCUSDT.P": "BTC/USDT:USDT",
     "BTCUSDT": "BTC/USDT:USDT",
     "MEXC:SOLUSDT": "SOL/USDT:USDT",
+    "MEXC:SOLUSDT.P": "SOL/USDT:USDT",
     "SOLUSDT": "SOL/USDT:USDT",
 }
 
@@ -139,19 +142,50 @@ def calc_contracts(symbol: str, usd_notional: float, price: float) -> int:
     raw = usd_notional / (price * cs)
     return max(1, int(math.floor(raw)))
 
-def validate_bar_timestamp(bar_ts: str) -> bool:
-    """Check if bar timestamp is not too stale (within BAR_STALENESS_HOURS)"""
+def _parse_bar_ts(bar_ts: Any) -> Optional[datetime]:
+    """
+    Parse bar_ts into a timezone-aware datetime (UTC).
+    Accepts:
+    - ISO8601 strings (e.g. 2025-01-13T12:00:00Z)
+    - Unix seconds (int/float or numeric string)
+    - Unix milliseconds (int/float or numeric string)
+    """
     try:
+        # numeric (int/float)
+        if isinstance(bar_ts, (int, float)):
+            ts = float(bar_ts)
+            # heuristic: milliseconds if large
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+
         if isinstance(bar_ts, str):
-            # Parse ISO format timestamp
-            dt = datetime.fromisoformat(bar_ts.replace('Z', '+00:00'))
-        else:
-            return False
-        
-        age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-        return age_hours <= BAR_STALENESS_HOURS
+            s = bar_ts.strip()
+            # numeric string
+            if s.isdigit():
+                ts = float(s)
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+            # ISO string
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        return None
     except Exception:
+        return None
+
+
+def validate_bar_timestamp(bar_ts: Any) -> bool:
+    """Check if bar timestamp is not too stale (within BAR_STALENESS_HOURS)."""
+    dt = _parse_bar_ts(bar_ts)
+    if not dt:
         return False
+    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    return age_hours <= BAR_STALENESS_HOURS
 
 def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
