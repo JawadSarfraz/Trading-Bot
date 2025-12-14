@@ -26,7 +26,7 @@ def get_db_connection():
             bar_ts TEXT,
             symbol_tv TEXT,
             side TEXT,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT,
             result_status TEXT
         )
     """)
@@ -56,11 +56,12 @@ def mark_email_processed(message_id: str, bar_ts: str, symbol_tv: str, side: str
     """Mark email as processed"""
     try:
         conn = get_db_connection()
+        processed_at = datetime.now(timezone.utc).isoformat()
         conn.execute(
             """INSERT OR REPLACE INTO processed_emails 
-               (message_id, bar_ts, symbol_tv, side, result_status) 
-               VALUES (?, ?, ?, ?, ?)""",
-            (message_id, bar_ts, symbol_tv, side, result_status)
+               (message_id, bar_ts, symbol_tv, side, processed_at, result_status) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (message_id, bar_ts, symbol_tv, side, processed_at, result_status)
         )
         conn.commit()
         conn.close()
