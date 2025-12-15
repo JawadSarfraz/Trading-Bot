@@ -99,7 +99,7 @@ def extract_json_from_email(body: str, subject: str = "") -> Optional[Dict]:
                     pass
 
             # Fallback 1: TradingView sometimes ends up showing dict-style payloads:
-            # {'secret':"x", 'symbol_tv':"MEXC:SOLUSDT", 'side':"long", 'bar_ts':"..."}
+            # {'secret':"x", 'symbol_tv':"BYBIT:SOLUSDT.P", 'side':"long", 'bar_ts':"..."}
             # Try safe Python literal eval, then ensure it's a dict.
             try:
                 obj = ast.literal_eval(s)
