@@ -1,15 +1,15 @@
-# TV-Binance Trading Bot
+# TV-Bybit Trading Bot
 
-An automated trading bot that receives TradingView alerts (via email or webhook) and executes futures orders on Binance USDT-M Futures exchange.
+An automated trading bot that receives TradingView alerts (via email or webhook) and executes futures orders on Bybit USDT-M Futures exchange.
 
 ## Overview
 
-This bot acts as a bridge between TradingView alerts and Binance USDT-M Futures trading:
+This bot acts as a bridge between TradingView alerts and Bybit USDT-M Futures trading:
 
 - **Email Integration**: Polls Gmail for TradingView email alerts (works with free TradingView accounts)
 - **Webhook Support**: Also supports direct webhook POST requests from TradingView
 - Validates and processes trading signals (long/short)
-- Places market orders on Binance USDT-M Futures exchange
+- Places market orders on Bybit USDT-M Futures exchange
 - Supports both DRY_RUN (simulation) and LIVE trading modes
 
 ## Features
@@ -29,7 +29,7 @@ This bot acts as a bridge between TradingView alerts and Binance USDT-M Futures 
 ## Prerequisites
 
 - Python 3.8+
-- Binance account with Futures enabled and API keys (for live trading)
+- Bybit account with Unified Trading Account (USDT-M Futures) enabled and API keys (for live trading)
 - TradingView account (free plan works with email alerts)
 - Gmail account with IMAP enabled (for email-based alerts)
 - VPS/Server for deployment (recommended) or Cloud Run
@@ -71,11 +71,12 @@ Create a `.env` file in the project root with the following variables:
 TV_WEBHOOK_SECRET=your_secret_key_here
 
 # Exchange Configuration
-EXCHANGE=binanceusdm              # Exchange ID (binanceusdm for Binance USDT-M Futures)
+EXCHANGE=bybit                    # Exchange ID (bybit for Bybit USDT-M Futures)
+ACCOUNT_TYPE=linear               # "linear" for Bybit USDT-M perps
 
-# Binance API (required for live trading)
-BINANCE_KEY=your_binance_api_key
-BINANCE_SECRET=your_binance_secret
+# Bybit API (required for live trading)
+BYBIT_KEY=your_bybit_api_key
+BYBIT_SECRET=your_bybit_secret
 
 # Trading Configuration
 POSITION_USDT=20              # Position size in USDT
@@ -107,36 +108,40 @@ PERSISTENCE_DB_PATH=processed_emails.db  # SQLite database path
 PRUNE_DAYS=30                 # Keep processed email records for 30 days
 ```
 
-### Binance API Setup
+### Bybit API Setup
 
-**Important:** Before using the bot with Binance, you must:
+**Important:** Before using the bot with Bybit, you must:
 
-1. **Activate Binance Futures:**
-   - Go to Binance → Derivatives → USDT-M Futures
-   - Complete Futures account activation if not already done
-   - Fund your USDT-M Futures wallet
+1. **Activate Bybit Unified Trading Account:**
+
+   - Go to Bybit → Derivatives → USDT-M Futures
+   - Complete Unified Trading Account activation if not already done
+   - Fund your USDT-M Futures wallet (Unified Trading balance)
 
 2. **Create API Key with Futures Permissions:**
-   - Go to Binance → Profile → API Management → Create API
-   - **Enable "Enable Futures"** (this sets `enableFutures=true`)
-   - **Enable "Read" and "Trade"** permissions for Futures
-   - If you created the API key before activating Futures, create a new key
+
+   - Go to Bybit → Account & Security → API Management → Create New Key
+   - **Enable "Read" and "Trade"** permissions for Derivatives
+   - **Keep "Withdrawals" disabled** for security
    - (Recommended) Set IP whitelist to your server's IP address
+   - Save the API key and secret (secret is shown only once)
 
 3. **Verify API Key:**
-   - The key must have `enableFutures=true` flag
+   - The key must have Derivatives trading permissions
    - Test with a small position first (`POSITION_USDT=5`)
+   - Ensure you're using one-way mode (not hedge mode)
 
 ### Environment Variables Explained
 
 **Trading Configuration:**
 
 - **TV_WEBHOOK_SECRET**: Secret key to authenticate TradingView alerts
-- **EXCHANGE**: Exchange ID (default: `binanceusdm` for Binance USDT-M Futures)
-- **BINANCE_KEY / BINANCE_SECRET**: API credentials from Binance (Futures Trading permission required)
+- **EXCHANGE**: Exchange ID (default: `bybit` for Bybit USDT-M Futures)
+- **ACCOUNT_TYPE**: Account type (default: `linear` for Bybit USDT-M perps)
+- **BYBIT_KEY / BYBIT_SECRET**: API credentials from Bybit (Derivatives Trading permission required)
 - **POSITION_USDT**: Notional position size in USDT (e.g., 20 = $20 position)
 - **DEFAULT_LEVERAGE**: Leverage multiplier (e.g., 5 = 5x leverage)
-- **ACCOUNT_TYPE**: Account type, use "swap" for USDT-M perpetual futures
+- **ACCOUNT_TYPE**: Account type, use "linear" for Bybit USDT-M perpetual futures
 - **COOLDOWN_SEC**: Minimum seconds between orders for the same symbol
 - **BAR_STALENESS_HOURS**: Ignore signals older than this (default: 48 hours)
 
@@ -190,7 +195,7 @@ ngrok http 8000
 
    ```pine
    // Example alert message format
-   alert_message = '{"secret":"your_secret","side":"long","symbol_tv":"BINANCE:ETHUSDT.P","bar_ts":"' + str.tostring(time) + '"}'
+   alert_message = '{"secret":"your_secret","side":"long","symbol_tv":"BYBIT:ETHUSDT.P","bar_ts":"' + str.tostring(time) + '"}'
    ```
 
 2. In TradingView alert settings:
@@ -247,7 +252,7 @@ Main webhook endpoint for TradingView alerts.
 {
   "secret": "your_secret",
   "side": "long",
-  "symbol_tv": "BINANCE:ETHUSDT.P",
+  "symbol_tv": "BYBIT:ETHUSDT.P",
   "bar_ts": "2025-01-13T12:00:00Z"
 }
 ```
@@ -300,19 +305,19 @@ Main webhook endpoint for TradingView alerts.
 
 The bot maps TradingView symbols to CCXT format. Currently supported:
 
-| TradingView Format      | CCXT Format     |
-| ----------------------- | --------------- |
-| `BINANCE:ETHUSDT`       | `ETH/USDT:USDT` |
-| `BINANCE:ETHUSDT.P`     | `ETH/USDT:USDT` |
-| `BINANCE:BTCUSDT`       | `BTC/USDT:USDT` |
-| `BINANCE:BTCUSDT.P`     | `BTC/USDT:USDT` |
-| `BINANCE:SOLUSDT`       | `SOL/USDT:USDT` |
-| `BINANCE:SOLUSDT.P`     | `SOL/USDT:USDT` |
-| `ETHUSDT`               | `ETH/USDT:USDT` |
-| `BTCUSDT`               | `BTC/USDT:USDT` |
-| `SOLUSDT`               | `SOL/USDT:USDT` |
+| TradingView Format | CCXT Format     |
+| ------------------ | --------------- |
+| `BYBIT:ETHUSDT`    | `ETH/USDT:USDT` |
+| `BYBIT:ETHUSDT.P`  | `ETH/USDT:USDT` |
+| `BYBIT:BTCUSDT`    | `BTC/USDT:USDT` |
+| `BYBIT:BTCUSDT.P`  | `BTC/USDT:USDT` |
+| `BYBIT:SOLUSDT`    | `SOL/USDT:USDT` |
+| `BYBIT:SOLUSDT.P`  | `SOL/USDT:USDT` |
+| `ETHUSDT`          | `ETH/USDT:USDT` |
+| `BTCUSDT`          | `BTC/USDT:USDT` |
+| `SOLUSDT`          | `SOL/USDT:USDT` |
 
-**Note:** TradingView perpetual contracts appear as `BINANCE:SOLUSDT.P` (with `.P` suffix). The bot supports both formats.
+**Note:** TradingView perpetual contracts appear as `BYBIT:SOLUSDT.P` (with `.P` suffix). The bot supports both formats.
 
 To add more symbols, edit the `SYMBOL_MAP` dictionary in `app.py`.
 
@@ -342,7 +347,7 @@ contracts = POSITION_USDT / (price * contract_size)
 6. **Cooldown Check** → Rejects if within cooldown period
 7. **Position Check** → Ignores if already in same position
 8. **Position Flipping** → Closes opposite position with reduce-only order (LIVE mode)
-9. **Order Execution** → Places market order on Binance USDT-M Futures
+9. **Order Execution** → Places market order on Bybit USDT-M Futures
 10. **State Update** → Updates in-memory position state and marks email as processed
 
 ### Webhook-Based Flow (Alternative)
@@ -353,7 +358,7 @@ contracts = POSITION_USDT / (price * contract_size)
 4. **Cooldown Check** → Rejects if within cooldown period
 5. **Position Check** → Ignores if already in same position
 6. **Position Flipping** → Closes opposite position if exists
-7. **Order Execution** → Places market order on Binance USDT-M Futures
+7. **Order Execution** → Places market order on Bybit USDT-M Futures
 8. **State Update** → Updates in-memory position state
 
 ## Deployment
@@ -394,7 +399,7 @@ contracts = POSITION_USDT / (price * contract_size)
 
    ```ini
    [Unit]
-   Description=TV-Binance Trading Bot
+   Description=TV-Bybit Trading Bot
    After=docker.service
    Requires=docker.service
 
@@ -431,7 +436,7 @@ contracts = POSITION_USDT / (price * contract_size)
 ⚠️ **Important Notes:**
 
 - **In-Memory State**: Position state is lost on server restart (email tracking persists)
-- **No Position Sync**: Doesn't fetch actual positions from Binance on startup
+- **No Position Sync**: Doesn't fetch actual positions from Bybit on startup
 - **TP/SL Not Placed**: Take profit and stop loss are calculated but not placed as orders
 - **Email Polling Delay**: 10-15 minute polling interval (acceptable for 1D timeframe signals)
 
@@ -445,7 +450,7 @@ curl -X POST http://localhost:8000/tv \
   -d '{
     "secret": "your_secret",
     "side": "long",
-    "symbol_tv": "BINANCE:ETHUSDT.P",
+    "symbol_tv": "BYBIT:ETHUSDT.P",
     "bar_ts": "2025-01-13T12:00:00Z"
   }'
 ```
@@ -460,7 +465,7 @@ curl http://localhost:8000/state
 
 - ✅ Never commit `.env` file to git
 - ✅ Use strong `TV_WEBHOOK_SECRET`
-- ✅ Restrict Binance API permissions (Futures Trading only, enableFutures=true)
+- ✅ Restrict Bybit API permissions (Derivatives Trading only, keep Withdrawals disabled)
 - ✅ Use HTTPS in production
 - ✅ Consider IP whitelisting if possible
 - ✅ Monitor logs for suspicious activity
@@ -469,11 +474,12 @@ curl http://localhost:8000/state
 
 **Order fails:**
 
-- Check Binance API keys are correct and have Futures permissions enabled
-- Verify Futures account is activated and has sufficient balance
+- Check Bybit API keys are correct and have Derivatives trading permissions enabled
+- Verify Unified Trading Account is activated and has sufficient balance
 - Check leverage settings match account limits
-- Review Binance API error messages
+- Review Bybit API error messages
 - Ensure IP whitelist (if enabled) includes your server IP
+- Ensure you're using one-way mode (not hedge mode) in Bybit
 
 **Webhook not received:**
 
