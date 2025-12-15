@@ -20,11 +20,26 @@ logger = logging.getLogger(__name__)
 
 # ---- ENV ----
 SECRET = os.getenv("TV_WEBHOOK_SECRET")
-API_KEY = os.getenv("MEXC_KEY")
-API_SEC = os.getenv("MEXC_SECRET")
+EXCHANGE_ID = os.getenv("EXCHANGE", "bybit").lower()  # bybit for Bybit USDT-M Futures
+ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "linear")  # "linear" for Bybit USDT-M perps
+
+# Exchange-specific API credentials
+if EXCHANGE_ID == "bybit":
+    API_KEY = os.getenv("BYBIT_KEY", "")
+    API_SEC = os.getenv("BYBIT_SECRET", "")
+elif EXCHANGE_ID == "mexc":
+    API_KEY = os.getenv("MEXC_KEY", "")
+    API_SEC = os.getenv("MEXC_SECRET", "")
+    ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "swap")  # MEXC uses "swap"
+elif EXCHANGE_ID == "binanceusdm":
+    API_KEY = os.getenv("BINANCE_KEY", "")
+    API_SEC = os.getenv("BINANCE_SECRET", "")
+    ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "swap")  # Binance uses "swap"
+else:
+    raise RuntimeError(f"Unsupported exchange: {EXCHANGE_ID}")
+
 POS_USDT = float(os.getenv("POSITION_USDT", "20"))
 LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
-ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "swap")  # "swap" for USDT-M perp
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "on")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
@@ -38,13 +53,33 @@ BAR_STALENESS_HOURS = int(os.getenv("BAR_STALENESS_HOURS", "48"))  # Ignore sign
 if not SECRET:
     raise RuntimeError("Missing TV_WEBHOOK_SECRET in .env")
 
-# ---- EXCHANGE (public endpoints are fine even without keys) ----
-exchange = ccxt.mexc({
-    "apiKey": API_KEY or "",
-    "secret": API_SEC or "",
-    "enableRateLimit": True,
-    "options": {"defaultType": ACCOUNT_TYPE},
-})
+# ---- EXCHANGE (dynamic based on EXCHANGE env var) ----
+# Initialize exchange based on EXCHANGE_ID
+if EXCHANGE_ID == "bybit":
+    exchange = ccxt.bybit({
+        "apiKey": API_KEY or "",
+        "secret": API_SEC or "",
+        "enableRateLimit": True,
+        "options": {"defaultType": ACCOUNT_TYPE},  # 'linear' for Bybit USDT-M
+    })
+elif EXCHANGE_ID == "mexc":
+    exchange = ccxt.mexc({
+        "apiKey": API_KEY or "",
+        "secret": API_SEC or "",
+        "enableRateLimit": True,
+        "options": {"defaultType": ACCOUNT_TYPE},  # 'swap' for MEXC
+    })
+elif EXCHANGE_ID == "binanceusdm":
+    exchange = ccxt.binanceusdm({
+        "apiKey": API_KEY or "",
+        "secret": API_SEC or "",
+        "enableRateLimit": True,
+        "options": {"defaultType": ACCOUNT_TYPE},  # 'swap' for Binance
+    })
+else:
+    raise RuntimeError(f"Unsupported exchange: {EXCHANGE_ID}")
+
+logger.info(f"Initialized exchange: {EXCHANGE_ID} (account_type={ACCOUNT_TYPE})")
 
 # ---- Background Tasks ----
 async def start_email_poller():
@@ -79,20 +114,37 @@ SEEN_KEYS = set()  # idempotency (bar_ts:symbol_tv:side)
 STATE: Dict[str, Dict[str, Any]] = {}  # {symbol: {side, entry, size, last_fill_ts, cooldown_until}}
 
 # TV -> CCXT symbol map (extend as needed)
+# Bybit USDT-M perps on TradingView appear as BYBIT:SOLUSDT.P or BYBIT:SOLUSDT
 SYMBOL_MAP = {
-    "MEXC:ETHUSDT": "ETH/USDT:USDT",
-    "MEXC:ETHUSDT.P": "ETH/USDT:USDT",  # TradingView sometimes adds .P suffix
+    # Bybit symbols (active)
+    "BYBIT:ETHUSDT": "ETH/USDT:USDT",
+    "BYBIT:ETHUSDT.P": "ETH/USDT:USDT",  # TradingView perpetual suffix
+    "BYBIT:BTCUSDT": "BTC/USDT:USDT",
+    "BYBIT:BTCUSDT.P": "BTC/USDT:USDT",
+    "BYBIT:SOLUSDT": "SOL/USDT:USDT",
+    "BYBIT:SOLUSDT.P": "SOL/USDT:USDT",
+    # Generic symbols (no exchange prefix)
     "ETHUSDT": "ETH/USDT:USDT",
-    "MEXC:BTCUSDT": "BTC/USDT:USDT",
-    "MEXC:BTCUSDT.P": "BTC/USDT:USDT",
     "BTCUSDT": "BTC/USDT:USDT",
-    "MEXC:SOLUSDT": "SOL/USDT:USDT",
-    "MEXC:SOLUSDT.P": "SOL/USDT:USDT",
     "SOLUSDT": "SOL/USDT:USDT",
+    # Binance symbols (commented out - can be re-enabled if needed)
+    # "BINANCE:ETHUSDT": "ETH/USDT:USDT",
+    # "BINANCE:ETHUSDT.P": "ETH/USDT:USDT",
+    # "BINANCE:BTCUSDT": "BTC/USDT:USDT",
+    # "BINANCE:BTCUSDT.P": "BTC/USDT:USDT",
+    # "BINANCE:SOLUSDT": "SOL/USDT:USDT",
+    # "BINANCE:SOLUSDT.P": "SOL/USDT:USDT",
+    # MEXC symbols commented out (can be re-enabled if needed)
+    # "MEXC:ETHUSDT": "ETH/USDT:USDT",
+    # "MEXC:ETHUSDT.P": "ETH/USDT:USDT",
+    # "MEXC:BTCUSDT": "BTC/USDT:USDT",
+    # "MEXC:BTCUSDT.P": "BTC/USDT:USDT",
+    # "MEXC:SOLUSDT": "SOL/USDT:USDT",
+    # "MEXC:SOLUSDT.P": "SOL/USDT:USDT",
 }
 
-# contract sizes for linear USDT-M perps
-CONTRACT_SIZE = {
+# Fallback contract sizes (used if exchange doesn't provide market data)
+CONTRACT_SIZE_FALLBACK = {
     "ETH/USDT:USDT": 0.01,   # 0.01 ETH per contract
     "BTC/USDT:USDT": 0.001,  # 0.001 BTC per contract
     "SOL/USDT:USDT": 0.1,    # 0.1 SOL per contract
@@ -102,7 +154,20 @@ def map_symbol(symbol_tv: str) -> str:
     return SYMBOL_MAP.get(symbol_tv, symbol_tv)
 
 def contract_size_for(symbol: str) -> float:
-    return CONTRACT_SIZE.get(symbol, 0.01)
+    """
+    Get contract size from exchange market data (dynamic).
+    Falls back to hardcoded values if exchange doesn't provide it.
+    """
+    try:
+        exchange.load_markets()
+        m = exchange.market(symbol)
+        cs = m.get("contractSize", None)
+        if cs is not None:
+            return float(cs)
+    except Exception:
+        pass
+    # Fallback to hardcoded values
+    return CONTRACT_SIZE_FALLBACK.get(symbol, 1.0)
 
 def now_ts() -> float:
     return time.time()
@@ -233,8 +298,8 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
         pass
     try:
         exchange.set_leverage(LEVERAGE, symbol)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"set_leverage failed for {symbol}: {e}")
     
     # Get current price
     try:
@@ -342,7 +407,7 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/")
 def root():
-    return {"ok": True, "dry_run": DRY_RUN, "account_type": ACCOUNT_TYPE}
+    return {"ok": True, "dry_run": DRY_RUN, "account_type": ACCOUNT_TYPE, "exchange": EXCHANGE_ID}
 
 @app.get("/health")
 def health():
@@ -352,6 +417,7 @@ def health():
         "trading_enabled": TRADING_ENABLED,
         "dry_run": DRY_RUN,
         "account_type": ACCOUNT_TYPE,
+        "exchange": EXCHANGE_ID,
     }
 
 @app.get("/state")

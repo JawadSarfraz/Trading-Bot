@@ -1,15 +1,15 @@
-# TV-MEXC Trading Bot
+# TV-Binance Trading Bot
 
-An automated trading bot that receives TradingView alerts (via email or webhook) and executes futures orders on MEXC exchange.
+An automated trading bot that receives TradingView alerts (via email or webhook) and executes futures orders on Binance USDT-M Futures exchange.
 
 ## Overview
 
-This bot acts as a bridge between TradingView alerts and MEXC futures trading:
+This bot acts as a bridge between TradingView alerts and Binance USDT-M Futures trading:
 
 - **Email Integration**: Polls Gmail for TradingView email alerts (works with free TradingView accounts)
 - **Webhook Support**: Also supports direct webhook POST requests from TradingView
 - Validates and processes trading signals (long/short)
-- Places market orders on MEXC futures exchange
+- Places market orders on Binance USDT-M Futures exchange
 - Supports both DRY_RUN (simulation) and LIVE trading modes
 
 ## Features
@@ -29,7 +29,7 @@ This bot acts as a bridge between TradingView alerts and MEXC futures trading:
 ## Prerequisites
 
 - Python 3.8+
-- MEXC account with API keys (for live trading)
+- Binance account with Futures enabled and API keys (for live trading)
 - TradingView account (free plan works with email alerts)
 - Gmail account with IMAP enabled (for email-based alerts)
 - VPS/Server for deployment (recommended) or Cloud Run
@@ -70,9 +70,12 @@ Create a `.env` file in the project root with the following variables:
 # Required
 TV_WEBHOOK_SECRET=your_secret_key_here
 
-# MEXC API (required for live trading)
-MEXC_KEY=your_mexc_api_key
-MEXC_SECRET=your_mexc_secret
+# Exchange Configuration
+EXCHANGE=binanceusdm              # Exchange ID (binanceusdm for Binance USDT-M Futures)
+
+# Binance API (required for live trading)
+BINANCE_KEY=your_binance_api_key
+BINANCE_SECRET=your_binance_secret
 
 # Trading Configuration
 POSITION_USDT=20              # Position size in USDT
@@ -104,12 +107,33 @@ PERSISTENCE_DB_PATH=processed_emails.db  # SQLite database path
 PRUNE_DAYS=30                 # Keep processed email records for 30 days
 ```
 
+### Binance API Setup
+
+**Important:** Before using the bot with Binance, you must:
+
+1. **Activate Binance Futures:**
+   - Go to Binance → Derivatives → USDT-M Futures
+   - Complete Futures account activation if not already done
+   - Fund your USDT-M Futures wallet
+
+2. **Create API Key with Futures Permissions:**
+   - Go to Binance → Profile → API Management → Create API
+   - **Enable "Enable Futures"** (this sets `enableFutures=true`)
+   - **Enable "Read" and "Trade"** permissions for Futures
+   - If you created the API key before activating Futures, create a new key
+   - (Recommended) Set IP whitelist to your server's IP address
+
+3. **Verify API Key:**
+   - The key must have `enableFutures=true` flag
+   - Test with a small position first (`POSITION_USDT=5`)
+
 ### Environment Variables Explained
 
 **Trading Configuration:**
 
 - **TV_WEBHOOK_SECRET**: Secret key to authenticate TradingView alerts
-- **MEXC_KEY / MEXC_SECRET**: API credentials from MEXC (Futures Trading permission required)
+- **EXCHANGE**: Exchange ID (default: `binanceusdm` for Binance USDT-M Futures)
+- **BINANCE_KEY / BINANCE_SECRET**: API credentials from Binance (Futures Trading permission required)
 - **POSITION_USDT**: Notional position size in USDT (e.g., 20 = $20 position)
 - **DEFAULT_LEVERAGE**: Leverage multiplier (e.g., 5 = 5x leverage)
 - **ACCOUNT_TYPE**: Account type, use "swap" for USDT-M perpetual futures
@@ -166,7 +190,7 @@ ngrok http 8000
 
    ```pine
    // Example alert message format
-   alert_message = '{"secret":"your_secret","side":"long","symbol_tv":"MEXC:ETHUSDT","bar_ts":"' + str.tostring(time) + '"}'
+   alert_message = '{"secret":"your_secret","side":"long","symbol_tv":"BINANCE:ETHUSDT.P","bar_ts":"' + str.tostring(time) + '"}'
    ```
 
 2. In TradingView alert settings:
@@ -223,7 +247,7 @@ Main webhook endpoint for TradingView alerts.
 {
   "secret": "your_secret",
   "side": "long",
-  "symbol_tv": "MEXC:ETHUSDT",
+  "symbol_tv": "BINANCE:ETHUSDT.P",
   "bar_ts": "2025-01-13T12:00:00Z"
 }
 ```
@@ -276,14 +300,19 @@ Main webhook endpoint for TradingView alerts.
 
 The bot maps TradingView symbols to CCXT format. Currently supported:
 
-| TradingView Format | CCXT Format     |
-| ------------------ | --------------- |
-| `MEXC:ETHUSDT`     | `ETH/USDT:USDT` |
-| `ETHUSDT`          | `ETH/USDT:USDT` |
-| `MEXC:BTCUSDT`     | `BTC/USDT:USDT` |
-| `BTCUSDT`          | `BTC/USDT:USDT` |
-| `MEXC:SOLUSDT`     | `SOL/USDT:USDT` |
-| `SOLUSDT`          | `SOL/USDT:USDT` |
+| TradingView Format      | CCXT Format     |
+| ----------------------- | --------------- |
+| `BINANCE:ETHUSDT`       | `ETH/USDT:USDT` |
+| `BINANCE:ETHUSDT.P`     | `ETH/USDT:USDT` |
+| `BINANCE:BTCUSDT`       | `BTC/USDT:USDT` |
+| `BINANCE:BTCUSDT.P`     | `BTC/USDT:USDT` |
+| `BINANCE:SOLUSDT`       | `SOL/USDT:USDT` |
+| `BINANCE:SOLUSDT.P`     | `SOL/USDT:USDT` |
+| `ETHUSDT`               | `ETH/USDT:USDT` |
+| `BTCUSDT`               | `BTC/USDT:USDT` |
+| `SOLUSDT`               | `SOL/USDT:USDT` |
+
+**Note:** TradingView perpetual contracts appear as `BINANCE:SOLUSDT.P` (with `.P` suffix). The bot supports both formats.
 
 To add more symbols, edit the `SYMBOL_MAP` dictionary in `app.py`.
 
@@ -313,7 +342,7 @@ contracts = POSITION_USDT / (price * contract_size)
 6. **Cooldown Check** → Rejects if within cooldown period
 7. **Position Check** → Ignores if already in same position
 8. **Position Flipping** → Closes opposite position with reduce-only order (LIVE mode)
-9. **Order Execution** → Places market order on MEXC
+9. **Order Execution** → Places market order on Binance USDT-M Futures
 10. **State Update** → Updates in-memory position state and marks email as processed
 
 ### Webhook-Based Flow (Alternative)
@@ -324,7 +353,7 @@ contracts = POSITION_USDT / (price * contract_size)
 4. **Cooldown Check** → Rejects if within cooldown period
 5. **Position Check** → Ignores if already in same position
 6. **Position Flipping** → Closes opposite position if exists
-7. **Order Execution** → Places market order on MEXC
+7. **Order Execution** → Places market order on Binance USDT-M Futures
 8. **State Update** → Updates in-memory position state
 
 ## Deployment
@@ -365,7 +394,7 @@ contracts = POSITION_USDT / (price * contract_size)
 
    ```ini
    [Unit]
-   Description=TV-MEXC Trading Bot
+   Description=TV-Binance Trading Bot
    After=docker.service
    Requires=docker.service
 
@@ -402,7 +431,7 @@ contracts = POSITION_USDT / (price * contract_size)
 ⚠️ **Important Notes:**
 
 - **In-Memory State**: Position state is lost on server restart (email tracking persists)
-- **No Position Sync**: Doesn't fetch actual positions from MEXC on startup
+- **No Position Sync**: Doesn't fetch actual positions from Binance on startup
 - **TP/SL Not Placed**: Take profit and stop loss are calculated but not placed as orders
 - **Email Polling Delay**: 10-15 minute polling interval (acceptable for 1D timeframe signals)
 
@@ -416,7 +445,7 @@ curl -X POST http://localhost:8000/tv \
   -d '{
     "secret": "your_secret",
     "side": "long",
-    "symbol_tv": "MEXC:ETHUSDT",
+    "symbol_tv": "BINANCE:ETHUSDT.P",
     "bar_ts": "2025-01-13T12:00:00Z"
   }'
 ```
@@ -431,7 +460,7 @@ curl http://localhost:8000/state
 
 - ✅ Never commit `.env` file to git
 - ✅ Use strong `TV_WEBHOOK_SECRET`
-- ✅ Restrict MEXC API permissions (Futures Trading only)
+- ✅ Restrict Binance API permissions (Futures Trading only, enableFutures=true)
 - ✅ Use HTTPS in production
 - ✅ Consider IP whitelisting if possible
 - ✅ Monitor logs for suspicious activity
@@ -440,10 +469,11 @@ curl http://localhost:8000/state
 
 **Order fails:**
 
-- Check MEXC API keys are correct
-- Verify account has sufficient balance
+- Check Binance API keys are correct and have Futures permissions enabled
+- Verify Futures account is activated and has sufficient balance
 - Check leverage settings match account limits
-- Review MEXC API error messages
+- Review Binance API error messages
+- Ensure IP whitelist (if enabled) includes your server IP
 
 **Webhook not received:**
 

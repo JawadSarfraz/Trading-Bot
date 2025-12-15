@@ -1,0 +1,8 @@
+1 - place order with Real money using dummy script at 10min mark closing candle...
+    First put money to mexc Futures, around 110$ for testing stuff
+        Fund it via Binance
+2 - Now deploy our ngrok or something to server - first read what NGROK IS:D
+3 - Make everything Automate, like hiting the server URL and server place that fkking order
+4 - Try to test with 50$ money, and maybe make a email alert for real order so I can monitor whether actual order is being place???
+5 - LETS DO THIS ALL...
+
