@@ -14,7 +14,7 @@ This bot acts as a bridge between TradingView alerts and Bybit USDT-M Futures tr
 
 ## Features
 
-- ✅ **Email Integration**: Polls Gmail IMAP for TradingView email alerts (every 10-15 minutes)
+- ✅ **Email Integration**: Real-time IMAP IDLE listener for TradingView email alerts (1-3 second latency)
 - ✅ **Webhook Integration**: Receives TradingView alerts via HTTP POST (alternative method)
 - ✅ **Idempotency**: Prevents duplicate orders using email Message-ID + bar timestamp + symbol + side
 - ✅ **Cooldown Mechanism**: Configurable cooldown period between orders
@@ -100,8 +100,10 @@ IMAP_PASSWORD=your_gmail_app_password  # Gmail App Password (not regular passwor
 IMAP_LABEL=tv-alerts          # Gmail label for TradingView emails
 IMAP_FAILED_LABEL=tv-alerts-failed  # Label for failed email parsing
 
-# Email Polling
-POLL_INTERVAL_SEC=600         # Poll every 10 minutes (600 seconds)
+# Email IDLE Configuration (real-time email notifications)
+MAX_MESSAGE_AGE_MIN=5        # Ignore emails older than this (minutes)
+IDLE_RENEW_SEC=1500          # Renew IDLE connection every 25 minutes (Gmail limit is 29 min)
+LOG_LEVEL=INFO               # Logging level (INFO, DEBUG, etc.)
 
 # Persistence
 PERSISTENCE_DB_PATH=processed_emails.db  # SQLite database path
@@ -157,7 +159,9 @@ PRUNE_DAYS=30                 # Keep processed email records for 30 days
 - **IMAP_PASSWORD**: Gmail App Password (create in Google Account settings)
 - **IMAP_LABEL**: Gmail label for TradingView emails (create filter to auto-label)
 - **IMAP_FAILED_LABEL**: Label for emails that failed to parse
-- **POLL_INTERVAL_SEC**: How often to check for new emails (default: 600 = 10 minutes)
+- **MAX_MESSAGE_AGE_MIN**: Ignore emails older than this (default: 5 minutes)
+- **IDLE_RENEW_SEC**: Renew IDLE connection interval (default: 1500 = 25 minutes, Gmail limit is 29 min)
+- **LOG_LEVEL**: Logging level (default: INFO)
 
 ## Usage
 
@@ -438,7 +442,7 @@ contracts = POSITION_USDT / (price * contract_size)
 - **In-Memory State**: Position state is lost on server restart (email tracking persists)
 - **No Position Sync**: Doesn't fetch actual positions from Bybit on startup
 - **TP/SL Not Placed**: Take profit and stop loss are calculated but not placed as orders
-- **Email Polling Delay**: 10-15 minute polling interval (acceptable for 1D timeframe signals)
+- **Real-time Processing**: IMAP IDLE provides 1-3 second latency (much faster than polling)
 
 ## Testing
 
