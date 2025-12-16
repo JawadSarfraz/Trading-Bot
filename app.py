@@ -82,24 +82,25 @@ else:
 logger.info(f"Initialized exchange: {EXCHANGE_ID} (account_type={ACCOUNT_TYPE})")
 
 # ---- Background Tasks ----
-async def start_email_poller():
-    """Start email polling in background"""
+async def start_email_idle_listener():
+    """Start IMAP IDLE listener in background thread"""
     try:
-        from email_poller import poll_emails_loop
-        logger.info("Starting email poller background task...")
-        # Create background task
-        task = asyncio.create_task(poll_emails_loop())
-        # Don't await - let it run in background
-        logger.info("Email poller started successfully")
+        import threading
+        from email_idle import run_idle_forever
+        logger.info("Starting IMAP IDLE listener background thread...")
+        # Run IDLE in a daemon thread (blocking function)
+        thread = threading.Thread(target=run_idle_forever, name="imap-idle", daemon=True)
+        thread.start()
+        logger.info("IMAP IDLE listener started successfully")
     except Exception as e:
-        logger.error(f"Failed to start email poller: {e}")
+        logger.error(f"Failed to start IMAP IDLE listener: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
     logger.info("Application starting...")
-    await start_email_poller()
+    await start_email_idle_listener()
     yield
     # Shutdown
     logger.info("Application shutting down...")
@@ -123,10 +124,13 @@ SYMBOL_MAP = {
     "BYBIT:BTCUSDT.P": "BTC/USDT:USDT",
     "BYBIT:SOLUSDT": "SOL/USDT:USDT",
     "BYBIT:SOLUSDT.P": "SOL/USDT:USDT",
+    "BYBIT:CRVUSDT": "CRV/USDT:USDT",
+    "BYBIT:CRVUSDT.P": "CRV/USDT:USDT",
     # Generic symbols (no exchange prefix)
     "ETHUSDT": "ETH/USDT:USDT",
     "BTCUSDT": "BTC/USDT:USDT",
     "SOLUSDT": "SOL/USDT:USDT",
+    "CRVUSDT": "CRV/USDT:USDT",
     # Binance symbols (commented out - can be re-enabled if needed)
     # "BINANCE:ETHUSDT": "ETH/USDT:USDT",
     # "BINANCE:ETHUSDT.P": "ETH/USDT:USDT",
@@ -148,6 +152,7 @@ CONTRACT_SIZE_FALLBACK = {
     "ETH/USDT:USDT": 0.01,   # 0.01 ETH per contract
     "BTC/USDT:USDT": 0.001,  # 0.001 BTC per contract
     "SOL/USDT:USDT": 0.1,    # 0.1 SOL per contract
+    "CRV/USDT:USDT": 1.0,    # 1.0 CRV per contract (will be fetched from exchange if available)
 }
 
 def map_symbol(symbol_tv: str) -> str:
@@ -270,10 +275,11 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Validate payload
     side = payload.get("side")
     symbol_tv = payload.get("symbol_tv")
-    bar_ts = payload.get("bar_ts")
+    # Support both "bar_ts" and "time" for compatibility
+    bar_ts = payload.get("bar_ts") or payload.get("time")
     
     if side not in ("long", "short") or not symbol_tv or not bar_ts:
-        return {"status": "error", "message": "Missing required fields: side, symbol_tv, bar_ts"}
+        return {"status": "error", "message": "Missing required fields: side, symbol_tv, bar_ts (or time)"}
     
     # Validate secret if provided (for external calls)
     if payload.get("secret") and payload.get("secret") != SECRET:
