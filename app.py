@@ -156,7 +156,32 @@ CONTRACT_SIZE_FALLBACK = {
 }
 
 def map_symbol(symbol_tv: str) -> str:
-    return SYMBOL_MAP.get(symbol_tv, symbol_tv)
+    """
+    Map TradingView symbol to CCXT symbol format.
+    First tries static SYMBOL_MAP, then falls back to programmatic normalization.
+    ChatGPT recommendation: Remove BYBIT: prefix and .P suffix programmatically.
+    """
+    # Try static map first
+    if symbol_tv in SYMBOL_MAP:
+        return SYMBOL_MAP[symbol_tv]
+    
+    # Programmatic normalization (ChatGPT recommendation)
+    normalized = symbol_tv
+    # Remove BYBIT: prefix
+    if normalized.startswith("BYBIT:"):
+        normalized = normalized[6:]  # Remove "BYBIT:"
+    # Remove .P suffix (perpetual contract indicator)
+    if normalized.endswith(".P"):
+        normalized = normalized[:-2]  # Remove ".P"
+    
+    # If normalized symbol looks like a base symbol (e.g., "CRVUSDT"), convert to CCXT format
+    if normalized.endswith("USDT") and "/" not in normalized:
+        # Convert CRVUSDT -> CRV/USDT:USDT for Bybit linear perps
+        base = normalized[:-4]  # Remove "USDT"
+        return f"{base}/USDT:USDT"
+    
+    # Fallback: return as-is or try static map again with normalized
+    return SYMBOL_MAP.get(normalized, normalized)
 
 def contract_size_for(symbol: str) -> float:
     """
@@ -275,15 +300,27 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Validate payload
     side = payload.get("side")
     symbol_tv = payload.get("symbol_tv")
-    # Support both "bar_ts" and "time" for compatibility
+    
+    # Support multiple timestamp formats: bar_ts, time, time_unix_ms
     bar_ts = payload.get("bar_ts") or payload.get("time")
     
+    # If time_unix_ms is provided (milliseconds), convert to seconds for parsing
+    if not bar_ts and payload.get("time_unix_ms"):
+        try:
+            ts_ms = float(payload.get("time_unix_ms"))
+            bar_ts = ts_ms / 1000.0  # Convert milliseconds to seconds
+        except Exception:
+            pass
+    
     if side not in ("long", "short") or not symbol_tv or not bar_ts:
-        return {"status": "error", "message": "Missing required fields: side, symbol_tv, bar_ts (or time)"}
+        return {"status": "error", "message": f"Missing required fields: side={side}, symbol_tv={symbol_tv}, bar_ts={bar_ts}. Available keys: {list(payload.keys())}"}
     
     # Validate secret if provided (for external calls)
-    if payload.get("secret") and payload.get("secret") != SECRET:
-        return {"status": "error", "message": "Invalid secret"}
+    # Reject empty secrets - ChatGPT recommendation: empty secret should fail validation
+    secret = payload.get("secret")
+    if secret is not None:  # If secret field exists (even if empty)
+        if not secret or secret != SECRET:  # Reject empty string or wrong secret
+            return {"status": "error", "message": f"Invalid or empty secret (expected: {SECRET[:10]}...)"}
     
     # Check bar staleness
     if not validate_bar_timestamp(bar_ts):
