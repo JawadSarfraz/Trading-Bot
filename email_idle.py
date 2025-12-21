@@ -96,25 +96,31 @@ def process_alert_email(raw_bytes: bytes) -> bool:
         execute_order = get_execute_order()
         result = execute_order(payload_dict)
         
-        # Mark as processed
+        # ChatGPT recommendation: Only mark as processed if order execution succeeded
         status = result.get("status", "unknown")
-        mark_email_processed(
-            message_id,
-            payload_dict.get("bar_ts", ""),
-            payload_dict.get("symbol_tv", ""),
-            payload_dict.get("side", ""),
-            status
-        )
         
         if status in ("ok", "simulated_ok"):
-            log.info(f"Alert processed successfully: {status}")
+            # Success - mark as processed
+            bar_ts = payload_dict.get("bar_ts") or payload_dict.get("time") or payload_dict.get("time_unix_ms") or ""
+            mark_email_processed(
+                message_id,
+                str(bar_ts),
+                payload_dict.get("symbol_tv", ""),
+                payload_dict.get("side", ""),
+                status
+            )
+            log.info(f"Alert processed successfully: {status} - Symbol: {payload_dict.get('symbol_tv')}, Side: {payload_dict.get('side')}")
             return True
         else:
-            log.warning(f"Alert processing returned: {status}")
+            # Failure - do NOT mark as processed (ChatGPT recommendation)
+            error_msg = result.get("message", "Unknown error")
+            log.warning(f"Alert processing failed: status={status}, error={error_msg}, payload={payload_dict}")
             return False
             
     except Exception as e:
-        log.error(f"Error processing alert email: {e}\n{traceback.format_exc()}")
+        # ChatGPT recommendation: Use logger.exception() for full stack traces
+        log.exception("Alert processing exception", extra={"payload": payload_dict, "message_id": message_id})
+        # Do NOT mark as processed on exception
         return False
 
 def is_processed(message_id: str) -> bool:
