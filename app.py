@@ -95,11 +95,48 @@ async def start_email_idle_listener():
     except Exception as e:
         logger.error(f"Failed to start IMAP IDLE listener: {e}")
 
+def sync_positions_from_exchange():
+    """
+    Sync STATE with actual exchange positions on startup.
+    This ensures bot state matches reality after restarts.
+    """
+    try:
+        logger.info("Syncing positions from exchange...")
+        positions = exchange.fetch_positions()
+        synced_count = 0
+        for pos in positions:
+            symbol = pos.get("symbol")
+            if not symbol:
+                continue
+            size = float(pos.get("contracts", 0))
+            if size != 0:  # Only sync non-zero positions
+                if symbol not in STATE:
+                    STATE[symbol] = {
+                        "side": "flat",
+                        "entry": None,
+                        "size": 0,
+                        "last_fill_ts": 0.0,
+                        "cooldown_until": 0.0,
+                    }
+                if size > 0:
+                    STATE[symbol]["side"] = "long"
+                    STATE[symbol]["size"] = size
+                elif size < 0:
+                    STATE[symbol]["side"] = "short"
+                    STATE[symbol]["size"] = abs(size)
+                STATE[symbol]["entry"] = float(pos.get("entryPrice", 0))
+                synced_count += 1
+                logger.info(f"Synced position: {symbol} {STATE[symbol]['side']} size={STATE[symbol]['size']}")
+        logger.info(f"Position sync complete: {synced_count} active positions found")
+    except Exception as e:
+        logger.warning(f"Failed to sync positions from exchange on startup: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
     logger.info("Application starting...")
+    sync_positions_from_exchange()  # Sync with exchange before starting
     await start_email_idle_listener()
     yield
     # Shutdown
@@ -214,7 +251,63 @@ def get_last_price(symbol: str) -> float:
     ticker = exchange.fetch_ticker(symbol)
     return float(ticker["last"])
 
+def fetch_exchange_position(symbol: str) -> Dict[str, Any]:
+    """
+    Fetch actual position from exchange (source of truth).
+    Returns: {side: "long"|"short"|"flat", size: float, entry: float|None}
+    """
+    try:
+        positions = exchange.fetch_positions([symbol])
+        if not positions:
+            return {"side": "flat", "size": 0.0, "entry": None}
+        
+        # CCXT returns list of positions, find the one for our symbol
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                size = float(pos.get("contracts", 0))
+                if size > 0:
+                    side = "long"
+                    entry = float(pos.get("entryPrice", 0))
+                elif size < 0:
+                    side = "short"
+                    entry = float(pos.get("entryPrice", 0))
+                    size = abs(size)  # Store as positive
+                else:
+                    side = "flat"
+                    entry = None
+                return {"side": side, "size": size, "entry": entry}
+        
+        return {"side": "flat", "size": 0.0, "entry": None}
+    except Exception as e:
+        logger.warning(f"Failed to fetch exchange position for {symbol}: {e}")
+        # Fallback to in-memory state if exchange fetch fails
+        return None
+
 def position_for(symbol: str) -> Dict[str, Any]:
+    """
+    Get position state, syncing with exchange if needed.
+    Exchange is source of truth - sync STATE before making decisions.
+    """
+    # First, try to sync with exchange (source of truth)
+    exchange_pos = fetch_exchange_position(symbol)
+    
+    if exchange_pos is not None:
+        # Sync STATE with exchange
+        if symbol not in STATE:
+            STATE[symbol] = {
+                "side": "flat",
+                "entry": None,
+                "size": 0,
+                "last_fill_ts": 0.0,
+                "cooldown_until": 0.0,
+            }
+        
+        # Update STATE with exchange data
+        STATE[symbol]["side"] = exchange_pos["side"]
+        STATE[symbol]["size"] = exchange_pos["size"]
+        STATE[symbol]["entry"] = exchange_pos["entry"]
+    
+    # Return STATE (now synced with exchange)
     if symbol not in STATE:
         STATE[symbol] = {
             "side": "flat",
