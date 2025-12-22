@@ -82,8 +82,14 @@ else:
 logger.info(f"Initialized exchange: {EXCHANGE_ID} (account_type={ACCOUNT_TYPE})")
 
 # ---- Background Tasks ----
+ENABLE_IMAP = os.getenv("ENABLE_IMAP", "false").lower() in ("1", "true", "yes", "on")
+
 async def start_email_idle_listener():
-    """Start IMAP IDLE listener in background thread"""
+    """Start IMAP IDLE listener in background thread (P2: optional via ENABLE_IMAP)"""
+    if not ENABLE_IMAP:
+        logger.info("IMAP IDLE listener disabled (ENABLE_IMAP=false). Using webhooks only.")
+        return
+    
     try:
         import threading
         from email_idle import run_idle_forever
@@ -324,6 +330,106 @@ def in_cooldown(pos: Dict[str, Any]) -> bool:
 def apply_cooldown(pos: Dict[str, Any]):
     pos["cooldown_until"] = now_ts() + COOLDOWN_SEC
 
+def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[float], sl: Optional[float]) -> Dict[str, Any]:
+    """
+    P0: Place TP/SL orders on Bybit exchange (reduce-only, exchange-native).
+    Uses Bybit's conditional orders API via CCXT.
+    Returns dict with tp_order_id and sl_order_id (or None if not placed).
+    """
+    result = {"tp_order_id": None, "sl_order_id": None, "tp_error": None, "sl_error": None}
+    
+    if DRY_RUN:
+        logger.info(f"[DRY_RUN] Would place TP={tp}, SL={sl} for {symbol} ({side}, {contracts} contracts)")
+        return result
+    
+    if not tp and not sl:
+        logger.info(f"No TP/SL to place for {symbol}")
+        return result
+    
+    try:
+        # Bybit conditional orders: use create_order with specific params
+        # TP: Conditional limit order (reduce-only)
+        # SL: Conditional stop-market order (reduce-only)
+        
+        if tp:
+            try:
+                # For long: TP is above entry, sell limit at tp price
+                # For short: TP is below entry, buy limit at tp price
+                if side == "long":
+                    # Take profit: conditional limit sell order at tp price
+                    tp_order = exchange.create_order(
+                        symbol,
+                        "limit",
+                        "sell",
+                        contracts,
+                        tp,
+                        params={
+                            "reduceOnly": True,
+                            "timeInForce": "GTC",  # Good Till Cancel
+                        }
+                    )
+                else:  # short
+                    # Take profit: conditional limit buy order at tp price
+                    tp_order = exchange.create_order(
+                        symbol,
+                        "limit",
+                        "buy",
+                        contracts,
+                        tp,
+                        params={
+                            "reduceOnly": True,
+                            "timeInForce": "GTC",
+                        }
+                    )
+                result["tp_order_id"] = tp_order.get("id")
+                logger.info(f"Placed TP order {result['tp_order_id']} at {tp} for {symbol}")
+            except Exception as e:
+                result["tp_error"] = str(e)
+                logger.error(f"Failed to place TP order for {symbol}: {e}")
+        
+        if sl:
+            try:
+                # For long: SL is below entry, sell stop-market at sl price
+                # For short: SL is above entry, buy stop-market at sl price
+                if side == "long":
+                    # Stop loss: conditional stop-market sell order
+                    sl_order = exchange.create_order(
+                        symbol,
+                        "stop",
+                        "sell",
+                        contracts,
+                        None,  # stop order, price comes from stopPrice
+                        params={
+                            "reduceOnly": True,
+                            "stopPrice": sl,  # Trigger price for stop order
+                        }
+                    )
+                else:  # short
+                    # Stop loss: conditional stop-market buy order
+                    sl_order = exchange.create_order(
+                        symbol,
+                        "stop",
+                        "buy",
+                        contracts,
+                        None,
+                        params={
+                            "reduceOnly": True,
+                            "stopPrice": sl,
+                        }
+                    )
+                result["sl_order_id"] = sl_order.get("id")
+                logger.info(f"Placed SL order {result['sl_order_id']} at {sl} for {symbol}")
+            except Exception as e:
+                result["sl_error"] = str(e)
+                logger.error(f"Failed to place SL order for {symbol}: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error placing TP/SL orders for {symbol}: {e}")
+        result["tp_error"] = str(e)
+        result["sl_error"] = str(e)
+    
+    return result
+
 def calc_contracts(symbol: str, usd_notional: float, price: float) -> int:
     cs = contract_size_for(symbol)
     # contracts = notional / (price * contractSize)
@@ -423,23 +529,70 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not validate_bar_timestamp(bar_ts):
         return {"status": "stale_signal", "message": f"Bar timestamp is older than {BAR_STALENESS_HOURS} hours"}
     
-    # Idempotency check
-    dedupe_key = f"{bar_ts}:{symbol_tv}:{side}"
+    # P1: Persistent idempotency check (survives restarts)
+    # Key format: exchange_symbol_side_timeframe_time_unix_ms
+    timeframe = payload.get("timeframe", "unknown")
+    time_unix_ms = payload.get("time_unix_ms") or str(int(float(bar_ts) * 1000))
+    dedupe_key = f"{EXCHANGE_ID}_{symbol_tv}_{side}_{timeframe}_{time_unix_ms}"
+    
+    # Check in-memory cache first (fast path)
     if dedupe_key in SEEN_KEYS:
-        return {"status": "duplicate_ignored"}
+        return {"status": "duplicate_ignored", "message": "Signal already processed (in-memory)"}
+    
+    # Check persistent storage (SQLite)
+    from persistence import is_signal_processed, mark_signal_processed
+    if is_signal_processed(dedupe_key):
+        logger.info(f"Duplicate signal detected: {dedupe_key}")
+        return {"status": "duplicate_ignored", "message": "Signal already processed (persistent)"}
+    
+    # Mark as seen (will mark as processed after successful execution)
     SEEN_KEYS.add(dedupe_key)
     
     symbol = map_symbol(symbol_tv)
     
-    # Load markets and set leverage
+    # P1: Use TradingView payload values (tp, sl, notional, leverage, margin_mode)
+    # Priority: payload > env vars > defaults
+    notional = payload.get("notional")
+    if notional is not None:
+        try:
+            notional = float(notional)
+        except (ValueError, TypeError):
+            notional = POS_USDT
+    else:
+        notional = POS_USDT
+    
+    leverage = payload.get("leverage")
+    if leverage is not None:
+        try:
+            leverage = int(leverage)
+        except (ValueError, TypeError):
+            leverage = LEVERAGE
+    else:
+        leverage = LEVERAGE
+    
+    margin_mode = payload.get("margin_mode", "isolated")  # Default to isolated for safety
+    
+    # Load markets and set leverage/margin mode
     try:
         exchange.load_markets()
     except Exception:
         pass
+    
+    # Set leverage (from payload or env)
     try:
-        exchange.set_leverage(LEVERAGE, symbol)
+        exchange.set_leverage(leverage, symbol)
+        logger.info(f"Set leverage to {leverage}x for {symbol}")
     except Exception as e:
         logger.warning(f"set_leverage failed for {symbol}: {e}")
+    
+    # P2: Enforce margin mode explicitly
+    try:
+        if EXCHANGE_ID == "bybit":
+            # Bybit uses set_margin_mode via params
+            exchange.set_margin_mode(margin_mode, symbol)
+            logger.info(f"Set margin mode to {margin_mode} for {symbol}")
+    except Exception as e:
+        logger.warning(f"set_margin_mode failed for {symbol}: {e} (may not be supported)")
     
     # Get current price
     try:
@@ -470,23 +623,58 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
                     exchange.create_market_buy_order(symbol, pos["size"], params={"reduceOnly": True})
             except Exception as e:
                 # Log error but continue with new position
-                pass
+                logger.warning(f"Failed to close opposite position: {e}")
         pos["side"] = "flat"
         pos["entry"] = None
         pos["size"] = 0
     
-    # Calculate contract size
-    contracts = calc_contracts(symbol, POS_USDT, last)
+    # Calculate contract size using payload notional or env var
+    contracts = calc_contracts(symbol, notional, last)
     
-    # Calculate TP/SL levels
-    if TP_PCT > 0:
+    # P0: Calculate TP/SL levels - Priority: payload absolute prices > payload pct > env pct
+    tp = None
+    sl = None
+    
+    # First, try absolute prices from payload
+    if payload.get("tp") is not None:
+        try:
+            tp = float(payload.get("tp"))
+            logger.info(f"Using TP from payload: {tp}")
+        except (ValueError, TypeError):
+            pass
+    
+    if payload.get("sl") is not None:
+        try:
+            sl = float(payload.get("sl"))
+            logger.info(f"Using SL from payload: {sl}")
+        except (ValueError, TypeError):
+            pass
+    
+    # If not in payload, try percentage from payload
+    if tp is None and payload.get("tp_pct") is not None:
+        try:
+            tp_pct = float(payload.get("tp_pct"))
+            tp = last * (1 + tp_pct if side == "long" else 1 - tp_pct)
+            logger.info(f"Computed TP from payload tp_pct: {tp}")
+        except (ValueError, TypeError):
+            pass
+    
+    if sl is None and payload.get("sl_pct") is not None:
+        try:
+            sl_pct = float(payload.get("sl_pct"))
+            sl = last * (1 - sl_pct if side == "long" else 1 + sl_pct)
+            logger.info(f"Computed SL from payload sl_pct: {sl}")
+        except (ValueError, TypeError):
+            pass
+    
+    # Fallback to env vars if still None
+    if tp is None and TP_PCT > 0:
         tp = last * (1 + TP_PCT if side == "long" else 1 - TP_PCT)
-    else:
-        tp = None
-    if SL_PCT > 0:
+        logger.info(f"Computed TP from env TP_PCT: {tp}")
+    
+    if sl is None and SL_PCT > 0:
         sl = last * (1 - SL_PCT if side == "long" else 1 + SL_PCT)
-    else:
-        sl = None
+        logger.info(f"Computed SL from env SL_PCT: {sl}")
     
     # Place order
     if DRY_RUN:
@@ -519,13 +707,23 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
             order = exchange.create_market_sell_order(symbol, contracts)
         
         order_id = order.get("id")
+        fill_price = order.get("price") or order.get("average") or last  # Use actual fill price if available
+        
+        # P0: Place TP/SL orders on exchange immediately after entry
+        tp_sl_result = place_tp_sl_orders(symbol, side, contracts, tp, sl)
         
         # Update state
         pos["side"] = side
-        pos["entry"] = last
+        pos["entry"] = fill_price
         pos["size"] = contracts
         pos["last_fill_ts"] = now_ts()
         apply_cooldown(pos)
+        
+        # P1: Mark signal as processed in persistent storage (only on success)
+        from persistence import mark_signal_processed
+        timeframe = payload.get("timeframe", "unknown")
+        time_unix_ms = payload.get("time_unix_ms") or str(int(float(bar_ts) * 1000))
+        mark_signal_processed(dedupe_key, EXCHANGE_ID, symbol_tv, side, timeframe, time_unix_ms, "ok")
         
         return {
             "status": "ok",
@@ -534,13 +732,21 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
             "amount_sent": contracts,
             "contracts_mode": True,
             "contractSize": contract_size_for(symbol),
-            "price_used": last,
+            "price_used": fill_price,
             "order_id": order_id,
             "flipped_from": flipped_from,
             "tp": tp,
             "sl": sl,
+            "tp_order_id": tp_sl_result.get("tp_order_id"),
+            "sl_order_id": tp_sl_result.get("sl_order_id"),
+            "tp_error": tp_sl_result.get("tp_error"),
+            "sl_error": tp_sl_result.get("sl_error"),
+            "notional_used": notional,
+            "leverage_used": leverage,
+            "margin_mode_used": margin_mode,
         }
     except Exception as e:
+        logger.exception(f"Order execution failed for {symbol}: {e}")
         return {"status": "error", "message": f"Order error: {e}"}
 
 # ---- Routes ----
@@ -566,22 +772,32 @@ def state():
 
 @app.post("/tv")
 async def tv(req: Request):
-    """Webhook endpoint for TradingView alerts (direct POST)"""
+    """
+    Webhook endpoint for TradingView alerts (direct POST).
+    P1: Returns HTTP 200 for validation errors to prevent TradingView retries.
+    """
     try:
         payload = await req.json()
     except Exception:
-        raise HTTPException(400, "Invalid JSON")
+        # P1: Return 200 with error status (not 400) to prevent retries
+        return {"status": "error", "message": "Invalid JSON"}
 
     if payload.get("secret") != SECRET:
-        raise HTTPException(403, "Bad secret")
+        # P1: Return 200 with error status (not 403) to prevent retries
+        return {"status": "error", "message": "Bad secret"}
     
     # Use extracted execute_order function
     result = execute_order(payload)
     
-    # Convert error status to HTTP exceptions for webhook compatibility
-    if result.get("status") == "error":
-        raise HTTPException(500, result.get("message", "Order execution failed"))
-    if result.get("status") == "trading_disabled":
-        raise HTTPException(503, "Trading is disabled")
+    # P1: Return HTTP 200 for all validation/business rule errors
+    # Only use non-200 for temporary infrastructure failures
+    status = result.get("status", "unknown")
     
+    if status in ("error", "stale_signal", "cooldown", "already_in_position", 
+                  "duplicate_ignored", "trading_disabled"):
+        # Validation/business rule errors - return 200 to prevent retries
+        return result
+    
+    # Only use non-200 for truly temporary failures (exchange down, etc.)
+    # For now, we'll return 200 for everything to be safe
     return result
