@@ -412,8 +412,12 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Reject empty secrets - ChatGPT recommendation: empty secret should fail validation
     secret = payload.get("secret")
     if secret is not None:  # If secret field exists (even if empty)
-        if not secret or secret != SECRET:  # Reject empty string or wrong secret
-            return {"status": "error", "message": f"Invalid or empty secret (expected: {SECRET[:10]}...)"}
+        if not secret:  # Empty string
+            logger.warning(f"Rejected alert: empty secret. Symbol={symbol_tv}, Side={side}. Fix TradingView alert to include secret={SECRET}")
+            return {"status": "error", "message": f"Empty secret rejected. TradingView alert must include secret field with value: {SECRET}"}
+        if secret != SECRET:  # Wrong secret
+            logger.warning(f"Rejected alert: invalid secret. Symbol={symbol_tv}, Side={side}")
+            return {"status": "error", "message": f"Invalid secret (expected: {SECRET[:10]}...)"}
     
     # Check bar staleness
     if not validate_bar_timestamp(bar_ts):

@@ -79,7 +79,7 @@ def process_alert_email(raw_bytes: bytes) -> bool:
         # Note: process_email expects (uid, message_id, payload, raw_body)
         # We'll adapt it - for IDLE we don't have uid until we fetch
         # So we'll create a wrapper that fetches the email properly
-        log.info(f"Processing alert email: Message-ID={message_id}, Symbol={payload_dict.get('symbol_tv')}, Side={payload_dict.get('side')}")
+        log.info(f"Processing alert email: Message-ID={message_id}, Symbol={payload_dict.get('symbol_tv')}, Side={payload_dict.get('side')}, Secret={'***' if payload_dict.get('secret') else 'EMPTY/MISSING'}")
         
         # We need to fetch the email with UID to mark it as seen
         # For now, we'll process it and mark it via a different mechanism
