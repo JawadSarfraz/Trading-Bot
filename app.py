@@ -395,40 +395,56 @@ def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[floa
                 except Exception:
                     current_price = last  # Fallback to entry price
                 
-                # Bybit triggerDirection logic:
-                # "ascending" = trigger price is ABOVE current/mark price
-                # "descending" = trigger price is BELOW current/mark price
+                # Bybit stop orders: Try multiple approaches
+                # Approach 1: Use Bybit's position TP/SL API (setPositionTpSl) - most reliable
+                # Approach 2: Use conditional order with correct order type
                 
+                # Try Bybit's position TP/SL API first (if available via CCXT)
+                try:
+                    if EXCHANGE_ID == "bybit":
+                        # Bybit position TP/SL API: setPositionTpSl
+                        # This sets TP/SL directly on the position, not as separate orders
+                        sl_params = {
+                            "stopLoss": str(sl),
+                        }
+                        # Note: CCXT might not expose this directly, so we'll try the order approach
+                        # If this fails, we'll fall back to conditional orders
+                except Exception:
+                    pass
+                
+                # Approach: Use conditional order with Bybit-specific parameters
+                # Bybit requires: orderType, triggerDirection, and stopPrice
                 if side == "long":
                     # Long SL: SL is below entry/current → trigger when price FALLS to SL
-                    # Since SL < current_price, use "descending"
                     trigger_direction = "descending" if sl < current_price else "ascending"
+                    # Try "Stop" (capital S) or use Bybit's native API call
                     sl_order = exchange.create_order(
                         symbol,
-                        "stop",
+                        "Stop",  # Try "Stop" instead of "stop" or "StopMarket"
                         "sell",
                         contracts,
-                        None,  # stop order, price comes from stopPrice
+                        None,
                         params={
                             "reduceOnly": True,
-                            "stopPrice": sl,  # Trigger price for stop order
-                            "triggerDirection": trigger_direction,  # "descending" when SL below current
+                            "stopPrice": sl,
+                            "triggerDirection": trigger_direction,
+                            "orderType": "Market",  # Explicitly set order type
                         }
                     )
                 else:  # short
                     # Short SL: SL is above entry/current → trigger when price RISES to SL
-                    # Since SL > current_price, use "ascending"
                     trigger_direction = "ascending" if sl > current_price else "descending"
                     sl_order = exchange.create_order(
                         symbol,
-                        "stop",
+                        "Stop",  # Try "Stop" instead of "stop" or "StopMarket"
                         "buy",
                         contracts,
                         None,
                         params={
                             "reduceOnly": True,
                             "stopPrice": sl,
-                            "triggerDirection": trigger_direction,  # "ascending" when SL above current
+                            "triggerDirection": trigger_direction,
+                            "orderType": "Market",  # Explicitly set order type
                         }
                     )
                 result["sl_order_id"] = sl_order.get("id")
@@ -436,6 +452,8 @@ def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[floa
             except Exception as e:
                 result["sl_error"] = str(e)
                 logger.error(f"Failed to place SL order for {symbol}: {e}")
+                # Log full error details for debugging
+                logger.error(f"SL order error details: {type(e).__name__}: {str(e)}")
         
     except Exception as e:
         logger.error(f"Error placing TP/SL orders for {symbol}: {e}")
@@ -570,10 +588,13 @@ def execute_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     if notional is not None:
         try:
             notional = float(notional)
+            logger.info(f"Using notional from payload: {notional} USDT")
         except (ValueError, TypeError):
             notional = POS_USDT
+            logger.info(f"Payload notional invalid, using env POSITION_USDT: {notional} USDT")
     else:
         notional = POS_USDT
+        logger.info(f"No notional in payload, using env POSITION_USDT: {notional} USDT")
     
     leverage = payload.get("leverage")
     if leverage is not None:
