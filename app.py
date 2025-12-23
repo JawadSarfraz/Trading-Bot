@@ -389,10 +389,20 @@ def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[floa
         
         if sl:
             try:
-                # For long: SL is below entry, sell stop-market at sl price
-                # For short: SL is above entry, buy stop-market at sl price
+                # Get current price to determine triggerDirection
+                try:
+                    current_price = get_last_price(symbol)
+                except Exception:
+                    current_price = last  # Fallback to entry price
+                
+                # Bybit triggerDirection logic:
+                # "ascending" = trigger price is ABOVE current/mark price
+                # "descending" = trigger price is BELOW current/mark price
+                
                 if side == "long":
-                    # Stop loss: conditional stop-market sell order
+                    # Long SL: SL is below entry/current → trigger when price FALLS to SL
+                    # Since SL < current_price, use "descending"
+                    trigger_direction = "descending" if sl < current_price else "ascending"
                     sl_order = exchange.create_order(
                         symbol,
                         "stop",
@@ -402,10 +412,13 @@ def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[floa
                         params={
                             "reduceOnly": True,
                             "stopPrice": sl,  # Trigger price for stop order
+                            "triggerDirection": trigger_direction,  # "descending" when SL below current
                         }
                     )
                 else:  # short
-                    # Stop loss: conditional stop-market buy order
+                    # Short SL: SL is above entry/current → trigger when price RISES to SL
+                    # Since SL > current_price, use "ascending"
+                    trigger_direction = "ascending" if sl > current_price else "descending"
                     sl_order = exchange.create_order(
                         symbol,
                         "stop",
@@ -415,10 +428,11 @@ def place_tp_sl_orders(symbol: str, side: str, contracts: int, tp: Optional[floa
                         params={
                             "reduceOnly": True,
                             "stopPrice": sl,
+                            "triggerDirection": trigger_direction,  # "ascending" when SL above current
                         }
                     )
                 result["sl_order_id"] = sl_order.get("id")
-                logger.info(f"Placed SL order {result['sl_order_id']} at {sl} for {symbol}")
+                logger.info(f"Placed SL order {result['sl_order_id']} at {sl} for {symbol} (triggerDirection={trigger_direction}, current={current_price})")
             except Exception as e:
                 result["sl_error"] = str(e)
                 logger.error(f"Failed to place SL order for {symbol}: {e}")
